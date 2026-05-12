@@ -43,14 +43,6 @@ KnowledgeLibrary    PersonaLibrary
 | **Wiki 格式** | `.md` + YAML frontmatter，原生兼容 Obsidian，支持 `tags` |
 | **摘要生成** | DeepSeek V4 Flash 压缩对话历史 |
 
-## 安装
-
-```bash
-pip install memora
-# 或
-pip install git+https://github.com/yourname/memora.git
-```
-
 ## 快速开始
 
 项目根目录创建 `.env`：
