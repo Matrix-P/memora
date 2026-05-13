@@ -45,11 +45,12 @@ class LTMMemory:
             "time_start": self.time_start,
             "time_end": self.time_end,
             "ref_count": self.ref_count,
-            "embedding": self.embedding,
         }
 
     def to_mac(self) -> dict:
-        return self.to_meta()
+        d = self.to_meta()
+        d["embedding"] = self.embedding
+        return d
 
     @classmethod
     def from_entry(cls, entry: dict) -> "LTMMemory":
