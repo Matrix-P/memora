@@ -4,9 +4,7 @@ technical.md
 __pycache__/
 *.pyc
 *.pyo
-wiki/ltm/*.md
-wiki/knowledge/*.md
-wiki/persona/*.md
+mem/memory/
 test_memory.py
 test_integration.py
 *.egg-info/
