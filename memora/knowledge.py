@@ -1,7 +1,7 @@
-"""知识/经验库 (llmwiki #2)。
+"""知识/经验库。
 
 AI 主动从对话中提取的可复用知识和经验教训。
-存储为带 frontmatter 的 .md 文件。
+双份存储：peo/.md (人读) + mac/.json (机读)。
 """
 
 import time
@@ -50,6 +50,19 @@ class KnowledgeEntry:
             "embedding": self.embedding,
         }
 
+    def to_mac(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content": self.content,
+            "category": self.category,
+            "source": self.source,
+            "ref_count": self.ref_count,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "embedding": self.embedding,
+        }
+
     @classmethod
     def from_entry(cls, entry: dict) -> "KnowledgeEntry":
         return cls(
@@ -68,7 +81,8 @@ class KnowledgeEntry:
 class KnowledgeLibrary:
     def __init__(self, config: MemoryConfig = None):
         self.config = config or default_config
-        self._dir = self.config.knowledge_dir
+        self._peo = self.config.knowledge_peo_dir
+        self._mac = self.config.knowledge_mac_dir
 
     def add(self, title: str, content: str, category: str = "general",
             source: str = "", embedding: list[float] = None) -> KnowledgeEntry:
@@ -84,11 +98,11 @@ class KnowledgeLibrary:
         meta = entry.to_meta()
         meta["tags"] = ["knowledge", category]
         formatted = _format_knowledge_content(entry)
-        wu.write_entry(self._dir, entry.id, meta, formatted)
+        wu.write_entry(self._peo, self._mac, entry.id, meta, formatted, entry.to_mac())
         return entry
 
     def get(self, entry_id: str) -> KnowledgeEntry | None:
-        entry = wu.read_entry(self._dir, entry_id)
+        entry = wu.read_entry(self._peo, entry_id)
         if entry is None:
             return None
         return KnowledgeEntry.from_entry(entry)
@@ -103,23 +117,20 @@ class KnowledgeLibrary:
         entry.updated_at = time.time()
         meta = entry.to_meta()
         meta["tags"] = ["knowledge", entry.category]
-        wu.write_entry(self._dir, entry_id, meta, _format_knowledge_content(entry))
+        wu.write_entry(self._peo, self._mac, entry_id, meta,
+                      _format_knowledge_content(entry), entry.to_mac())
 
     def update_content(self, entry_id: str, content: str):
         entry = self.get(entry_id)
         if entry:
             entry.content = content
             entry.updated_at = time.time()
-            meta = entry.to_meta()
-            meta["tags"] = ["knowledge", entry.category]
-            wu.write_entry(self._dir, entry_id, meta, _format_knowledge_content(entry))
+            self.update(entry_id, content=content)
 
     def list_all(self) -> list[KnowledgeEntry]:
         results = []
-        for path in wu.scan_entries(self._dir):
-            meta, content = wu.parse_frontmatter(path)
-            meta["content"] = content
-            results.append(KnowledgeEntry.from_entry(meta))
+        for data in wu.scan_mac(self._mac):
+            results.append(KnowledgeEntry.from_entry(data))
         results.sort(key=lambda e: e.updated_at, reverse=True)
         return results
 
@@ -128,41 +139,42 @@ class KnowledgeLibrary:
 
     def list_categories(self) -> list[str]:
         cats = set()
-        for path in wu.scan_entries(self._dir):
-            meta, _ = wu.parse_frontmatter(path)
-            if "category" in meta:
-                cats.add(meta["category"])
+        for data in wu.scan_mac(self._mac):
+            if "category" in data:
+                cats.add(data["category"])
         return sorted(cats)
 
     def increment_ref(self, entry_id: str):
         entry = self.get(entry_id)
         if entry:
             entry.ref_count += 1
-            wu.update_metadata(self._dir, entry_id, {"ref_count": entry.ref_count})
+            wu.update_entry(self._peo, self._mac, entry_id,
+                           {"ref_count": entry.ref_count},
+                           mac_updates={"ref_count": entry.ref_count})
 
     def delete(self, entry_id: str):
-        wu.delete_entry_file(self._dir, entry_id)
+        wu.delete_entry(self._peo, self._mac, entry_id)
 
     def search_by_vector(self, query_embedding: list[float], top_k: int = 20) -> list[dict]:
         from .priority import cosine_similarity
         candidates = []
-        for e in self.list_all():
-            sim = cosine_similarity(query_embedding, e.embedding)
+        for data in wu.scan_mac(self._mac):
+            sim = cosine_similarity(query_embedding, data.get("embedding", []))
             candidates.append({
-                "id": e.id,
-                "title": e.title,
-                "content": e.content,
-                "category": e.category,
-                "embedding": e.embedding,
-                "ref_count": e.ref_count,
-                "created_at": e.created_at,
+                "id": data.get("id", ""),
+                "title": data.get("title", ""),
+                "content": data.get("content", ""),
+                "category": data.get("category", "general"),
+                "embedding": data.get("embedding", []),
+                "ref_count": data.get("ref_count", 0),
+                "created_at": data.get("created_at", 0),
                 "_similarity": sim,
             })
         candidates.sort(key=lambda x: x["_similarity"], reverse=True)
         return candidates[:top_k]
 
     def __len__(self):
-        return len(wu.scan_entries(self._dir))
+        return len(wu.scan_mac(self._mac))
 
 
 def _format_knowledge_content(entry: KnowledgeEntry) -> str:

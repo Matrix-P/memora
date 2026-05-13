@@ -1,9 +1,7 @@
-"""人设/用户库 (llmwiki #3)。
+"""人设/用户库。
 
-用户画像：偏好、习惯、背景、沟通风格。
-AI 人设：角色定位、性格特征、行为准则、回答风格。
-
-存储为带 frontmatter 的 .md 文件。
+用户画像 + AI 人设，带置信度评分和证据链。
+双份存储：peo/.md (人读) + mac/.json (机读)。
 """
 
 import time
@@ -14,7 +12,7 @@ from . import wiki_utils as wu
 class PersonaEntry:
     __slots__ = (
         "id", "type", "trait", "description",
-        "confidence", "evidence", "embedding",
+        "confidence", "evidence", "embedding", "ref_count",
         "created_at", "updated_at",
     )
 
@@ -27,6 +25,7 @@ class PersonaEntry:
         confidence: float = 0.5,
         evidence: list[str] = None,
         embedding: list[float] = None,
+        ref_count: int = None,
         created_at: float = None,
         updated_at: float = None,
     ):
@@ -37,6 +36,7 @@ class PersonaEntry:
         self.confidence = confidence
         self.evidence = evidence or []
         self.embedding = embedding or []
+        self.ref_count = ref_count if ref_count is not None else 0
         self.created_at = created_at or time.time()
         self.updated_at = updated_at or time.time()
 
@@ -47,6 +47,21 @@ class PersonaEntry:
             "trait": self.trait,
             "confidence": self.confidence,
             "evidence": self.evidence,
+            "ref_count": self.ref_count,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "embedding": self.embedding,
+        }
+
+    def to_mac(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "trait": self.trait,
+            "description": self.description,
+            "confidence": self.confidence,
+            "evidence": self.evidence,
+            "ref_count": self.ref_count,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "embedding": self.embedding,
@@ -58,10 +73,11 @@ class PersonaEntry:
             id=entry.get("id", ""),
             type=entry.get("type", ""),
             trait=entry.get("trait", ""),
-            description=entry.get("content", ""),
+            description=entry.get("content") or entry.get("description", ""),
             confidence=entry.get("confidence", 0.5),
             evidence=entry.get("evidence", []),
             embedding=entry.get("embedding", []),
+            ref_count=entry.get("ref_count", 0),
             created_at=entry.get("created_at"),
             updated_at=entry.get("updated_at"),
         )
@@ -70,7 +86,8 @@ class PersonaEntry:
 class PersonaLibrary:
     def __init__(self, config: MemoryConfig = None):
         self.config = config or default_config
-        self._dir = self.config.persona_dir
+        self._peo = self.config.persona_peo_dir
+        self._mac = self.config.persona_mac_dir
 
     def add(self, type: str, trait: str, description: str,
             confidence: float = 0.5, evidence: list[str] = None,
@@ -83,15 +100,16 @@ class PersonaLibrary:
             confidence=confidence,
             evidence=evidence or [],
             embedding=embedding or [],
+            ref_count=self.config.ref_base,
         )
         meta = entry.to_meta()
         meta["tags"] = ["persona", type]
         formatted = _format_persona_content(entry)
-        wu.write_entry(self._dir, entry.id, meta, formatted)
+        wu.write_entry(self._peo, self._mac, entry.id, meta, formatted, entry.to_mac())
         return entry
 
     def get(self, entry_id: str) -> PersonaEntry | None:
-        e = wu.read_entry(self._dir, entry_id)
+        e = wu.read_entry(self._peo, entry_id)
         if e is None:
             return None
         return PersonaEntry.from_entry(e)
@@ -100,21 +118,19 @@ class PersonaLibrary:
         entry = self.get(entry_id)
         if entry is None:
             raise FileNotFoundError(f"Persona entry {entry_id} not found")
-
         if "description" in kwargs:
             entry.description = kwargs.pop("description")
-        for field in ("type", "trait", "confidence", "evidence", "embedding"):
+        for field in ("type", "trait", "confidence", "evidence", "embedding", "ref_count"):
             if field in kwargs:
                 setattr(entry, field, kwargs[field])
         entry.updated_at = time.time()
-
         meta = entry.to_meta()
         meta["tags"] = ["persona", entry.type]
-        wu.write_entry(self._dir, entry_id, meta, _format_persona_content(entry))
+        wu.write_entry(self._peo, self._mac, entry_id, meta,
+                      _format_persona_content(entry), entry.to_mac())
 
     def upsert(self, type: str, trait: str, description: str,
                confidence: float = 0.5, evidence: list[str] = None) -> PersonaEntry:
-        """存在则更新置信度+证据，不存在则新建。"""
         existing = self.find_by_trait(type, trait)
         if existing:
             new_conf = min(1.0, existing.confidence + confidence * 0.1)
@@ -134,10 +150,8 @@ class PersonaLibrary:
 
     def list_all(self) -> list[PersonaEntry]:
         results = []
-        for path in wu.scan_entries(self._dir):
-            meta, content = wu.parse_frontmatter(path)
-            meta["content"] = content
-            results.append(PersonaEntry.from_entry(meta))
+        for data in wu.scan_mac(self._mac):
+            results.append(PersonaEntry.from_entry(data))
         results.sort(key=lambda e: e.updated_at, reverse=True)
         return results
 
@@ -150,33 +164,41 @@ class PersonaLibrary:
     def list_ai_persona(self) -> list[PersonaEntry]:
         return self.list_by_type("ai_persona")
 
+    def increment_ref(self, entry_id: str):
+        entry = self.get(entry_id)
+        if entry:
+            entry.ref_count += 1
+            wu.update_entry(self._peo, self._mac, entry_id,
+                           {"ref_count": entry.ref_count},
+                           mac_updates={"ref_count": entry.ref_count})
+
     def delete(self, entry_id: str):
-        wu.delete_entry_file(self._dir, entry_id)
+        wu.delete_entry(self._peo, self._mac, entry_id)
 
     def search_by_vector(self, query_embedding: list[float], top_k: int = 20) -> list[dict]:
         from .priority import cosine_similarity
         candidates = []
-        for e in self.list_all():
-            sim = cosine_similarity(query_embedding, e.embedding)
+        for data in wu.scan_mac(self._mac):
+            sim = cosine_similarity(query_embedding, data.get("embedding", []))
             candidates.append({
-                "id": e.id,
-                "type": e.type,
-                "trait": e.trait,
-                "description": e.description,
-                "embedding": e.embedding,
-                "ref_count": 0,
-                "created_at": e.created_at,
+                "id": data.get("id", ""),
+                "type": data.get("type", ""),
+                "trait": data.get("trait", ""),
+                "description": data.get("description", ""),
+                "confidence": data.get("confidence", 0.5),
+                "embedding": data.get("embedding", []),
+                "ref_count": data.get("ref_count", 0),
+                "created_at": data.get("created_at", 0),
                 "_similarity": sim,
             })
         candidates.sort(key=lambda x: x["_similarity"], reverse=True)
         return candidates[:top_k]
 
     def rebuild(self) -> dict:
-        """重构人设库：合并重复特征，清理低置信度条目。"""
+        """去重合并 + 删除低置信度条目。"""
         all_entries = self.list_all()
         merged = {}
         removed = 0
-
         for e in all_entries:
             key = (e.type, e.trait)
             if key in merged:
@@ -187,16 +209,14 @@ class PersonaLibrary:
                 removed += 1
             else:
                 merged[key] = e
-
-        for (typ, trait), entry in merged.items():
+        for _, entry in merged.items():
             self.update(entry.id,
                         confidence=entry.confidence,
                         evidence=entry.evidence)
-
         return {"total": len(merged), "merged": removed}
 
     def __len__(self):
-        return len(wu.scan_entries(self._dir))
+        return len(wu.scan_mac(self._mac))
 
 
 def _format_persona_content(entry: PersonaEntry) -> str:

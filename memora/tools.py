@@ -1,14 +1,14 @@
-"""AI Agent 可调用的记忆系统 Tool/Skill 定义。
+"""AI Agent 可调用的记忆系统 Tool/Skill 定义。"""
 
-提供给 LangChain/LangGraph agent 的标准工具接口。
-每个函数支持同步和异步两种调用方式。
-"""
-
+import os
+import time
 from .ltm import LongTermMemory
 from .knowledge import KnowledgeLibrary
 from .persona import PersonaLibrary
 from .retrieval import MemoryRetrieval
 from .config import MemoryConfig, default_config
+from . import wiki_utils as wu
+from .priority import compute_priority
 
 
 class MemoryTools:
@@ -24,46 +24,18 @@ class MemoryTools:
     # ── add_knowledge ──────────────────────────────────────
 
     def add_knowledge(
-        self,
-        title: str,
-        content: str,
-        category: str = "general",
-        source: str = "",
+        self, title: str, content: str,
+        category: str = "general", source: str = "",
     ) -> str:
-        """从对话中提取知识并存入知识库。
-
-        Args:
-            title: 知识条目标题
-            content: 知识内容
-            category: 分类标签（如 coding_style, tech_solution, concept）
-            source: 来源标识（对话ID等）
-        Returns:
-            新条目的 ID
-        """
         entry = self.knowledge.add(title, content, category, source)
         return entry.id
 
     # ── update_persona ─────────────────────────────────────
 
     def update_persona(
-        self,
-        type: str,
-        trait: str,
-        description: str,
-        confidence: float = 0.5,
-        evidence: str = "",
+        self, type: str, trait: str, description: str,
+        confidence: float = 0.5, evidence: str = "",
     ) -> str:
-        """更新用户画像或 AI 人设。存在则合并证据、提高置信度。
-
-        Args:
-            type: "user" 或 "ai_persona"
-            trait: 特征名称
-            description: 特征描述
-            confidence: 置信度 (0~1)
-            evidence: 支撑证据（引用对话片段或记忆ID）
-        Returns:
-            条目的 ID
-        """
         evidence_list = [evidence] if evidence else []
         entry = self.persona.upsert(type, trait, description, confidence, evidence_list)
         return entry.id
@@ -71,21 +43,8 @@ class MemoryTools:
     # ── search_memory ──────────────────────────────────────
 
     def search_memory(
-        self,
-        query: str,
-        memory_type: str = "all",
-        top_k: int = 5,
+        self, query: str, memory_type: str = "all", top_k: int = 5,
     ) -> str:
-        """跨库检索记忆，返回格式化的文本结果。
-
-        Args:
-            query: 搜索查询
-            memory_type: "ltm" | "knowledge" | "persona" | "all"
-            top_k: 返回数量
-        Returns:
-            格式化的检索结果文本
-        """
-        from .config import default_config
         embedding = self._embed(query)
         results = self.retrieval.search_and_record(embedding, memory_type, top_k)
         return self.retrieval.build_context(results)
@@ -93,47 +52,192 @@ class MemoryTools:
     # ── rebuild_library ────────────────────────────────────
 
     def rebuild_library(self, library: str = "all") -> str:
-        """触发库重构，去重、合并、清理。
+        """整仓维护: 遗忘 + fixed 入库 + 去重。
 
         Args:
-            library: "knowledge" | "persona" | "all"
-        Returns:
-            重构统计信息
+            library: "ltm" | "knowledge" | "persona" | "all"
         """
         parts = []
-
-        if library in ("knowledge", "all"):
-            kb_entries = self.knowledge.list_all()
-            merged = self._merge_similar_knowledge(kb_entries)
-            parts.append(f"知识库: 原有 {len(kb_entries)} 条 → 合并后 {merged} 条")
-
-        if library in ("persona", "all"):
-            stats = self.persona.rebuild()
-            parts.append(f"人设库: 原有条目 → 合并 {stats['merged']} 条重复，保留 {stats['total']} 条")
+        now = time.time()
 
         if library in ("ltm", "all"):
-            count = len(self.ltm)
-            parts.append(f"长期记忆库: {count} 条记忆（未变更）")
+            n_forgotten = self._forget_library("ltm", now)
+            n_synced = self._sync_fixed("ltm")
+            parts.append(
+                f"长期记忆库: 遗忘 {n_forgotten} 条, fixed 同步 {n_synced} 条, "
+                f"现存 {len(self.ltm)} 条"
+            )
+
+        if library in ("knowledge", "all"):
+            n_forgotten = self._forget_library("knowledge", now)
+            n_synced = self._sync_fixed("knowledge")
+            kb_entries = self.knowledge.list_all()
+            merged = self._merge_similar_knowledge(kb_entries)
+            parts.append(
+                f"知识库: 遗忘 {n_forgotten} 条, fixed 同步 {n_synced} 条, "
+                f"合并后 {merged} 条"
+            )
+
+        if library in ("persona", "all"):
+            n_forgotten = self._forget_library("persona", now)
+            n_synced = self._sync_fixed("persona")
+            stats = self.persona.rebuild()
+            parts.append(
+                f"人设库: 遗忘 {n_forgotten} 条, fixed 同步 {n_synced} 条, "
+                f"去重合并 {stats['merged']} 条, 保留 {stats['total']} 条"
+            )
 
         return "\n".join(parts) if parts else "未执行重构"
+
+    # ── 遗忘 ───────────────────────────────────────────────
+
+    def _forget_library(self, name: str, now: float) -> int:
+        """遍历库中所有条目, 删除优先级低于阈值的。"""
+        lib_map = {
+            "ltm": self.ltm,
+            "knowledge": self.knowledge,
+            "persona": self.persona,
+        }
+        lib = lib_map[name]
+        cfg = self.config
+        to_delete = []
+
+        for entry in lib.list_all():
+            priority = compute_priority(
+                similarity=0.5,  # 遗忘检查用中性相似度
+                ref_count=entry.ref_count,
+                created_at=entry.created_at,
+                now=now,
+                config=cfg,
+            )
+            if priority < cfg.forgetting_threshold:
+                to_delete.append(entry.id)
+
+        for eid in to_delete:
+            lib.delete(eid)
+        return len(to_delete)
+
+    # ── fixed/ 同步 ────────────────────────────────────────
+
+    def _sync_fixed(self, name: str) -> int:
+        """扫描 fixed/{name}/ 下的 .md, 检测新增/修改 → 入库。"""
+        cfg = self.config
+        fixed_dirs = {
+            "ltm": cfg.fixed_ltm_dir,
+            "knowledge": cfg.fixed_knowledge_dir,
+            "persona": cfg.fixed_persona_dir,
+        }
+        fixed_dir = fixed_dirs[name]
+        if not os.path.isdir(fixed_dir):
+            return 0
+
+        # 加载历史哈希 (存在 peo/ 的元数据里或单独 track)
+        known_hashes = self._load_fixed_hashes(name)
+        synced = 0
+
+        for fname in sorted(os.listdir(fixed_dir)):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(fixed_dir, fname)
+            current_hash = wu.file_hash(fpath)
+            if not current_hash:
+                continue
+
+            # 检查是否已处理过 (未变化)
+            prev_id = known_hashes.get(fname)
+            if prev_id and known_hashes.get(f"{fname}.hash") == current_hash:
+                continue
+
+            # 读内容
+            meta, content = wu.parse_frontmatter(fpath)
+            if not content.strip():
+                continue
+
+            processed = self._process_fixed_entry(name, meta, content, fname)
+            if processed:
+                # 记录 hash
+                known_hashes[fname] = processed
+                known_hashes[f"{fname}.hash"] = current_hash
+                # 删除旧版本
+                if prev_id and prev_id != processed:
+                    lib = {"ltm": self.ltm, "knowledge": self.knowledge,
+                           "persona": self.persona}[name]
+                    try:
+                        lib.delete(prev_id)
+                    except Exception:
+                        pass
+                synced += 1
+
+        self._save_fixed_hashes(name, known_hashes)
+        return synced
+
+    def _process_fixed_entry(self, name: str, meta: dict, content: str,
+                             fname: str) -> str | None:
+        """处理单条 fixed 文件: 嵌入 → 入库。返回 entry_id。"""
+        if name == "ltm":
+            title = meta.get("title", fname[:-3])
+            # fixed LTM: 直接作为摘要入库
+            emb = self._embed(content[:1000])
+            mem = self.ltm.add(summary=content.strip(), embedding=emb)
+            return mem.id
+
+        elif name == "knowledge":
+            title = meta.get("title", fname[:-3])
+            category = meta.get("category", "general")
+            source = meta.get("source", f"fixed/{fname}")
+            emb = self._embed(f"{title} {content[:200]}")
+            entry = self.knowledge.add(
+                title=title, content=content.strip(),
+                category=category, source=source, embedding=emb,
+            )
+            return entry.id
+
+        elif name == "persona":
+            etype = meta.get("type", "user")
+            trait = meta.get("trait", fname[:-3])
+            confidence = float(meta.get("confidence", 0.7))
+            evidence = meta.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            emb = self._embed(f"{trait}: {content[:200]}")
+            entry = self.persona.add(
+                type=etype, trait=trait, description=content.strip(),
+                confidence=confidence, evidence=evidence, embedding=emb,
+            )
+            return entry.id
+
+        return None
+
+    # ── fixed 哈希跟踪 ─────────────────────────────────────
+
+    def _hash_file_path(self, name: str) -> str:
+        return os.path.join(self.config.mem_dir, f".fixed_hashes_{name}.json")
+
+    def _load_fixed_hashes(self, name: str) -> dict:
+        import json
+        fp = self._hash_file_path(name)
+        if os.path.isfile(fp):
+            with open(fp, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
+
+    def _save_fixed_hashes(self, name: str, data: dict):
+        import json
+        fp = self._hash_file_path(name)
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     # ── 辅助方法 ───────────────────────────────────────────
 
     def _embed(self, text: str) -> list[float]:
-        """获取文本的向量嵌入。需要外部注入 embedding 函数。
-
-        默认返回空列表，应在初始化后设置 embed_fn。
-        """
         if hasattr(self, "_embed_fn") and self._embed_fn:
             return self._embed_fn(text)
         return []
 
     def set_embed_fn(self, fn):
-        """注入嵌入函数 fn(text: str) -> list[float]"""
         self._embed_fn = fn
 
     def _merge_similar_knowledge(self, entries) -> int:
-        """简单的知识条目合并：同标题只保留最新一条。"""
         seen = {}
         to_remove = []
         for e in entries:

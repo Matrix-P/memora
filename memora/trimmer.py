@@ -52,7 +52,6 @@ async def trim_and_summarize(
 
     time_start = discard[0].timestamp if discard else None
     time_end = discard[-1].timestamp if discard else None
-    original_tokens = sum(m.token_count for m in discard)
 
     embedding = None
     if embed_fn:
@@ -60,7 +59,6 @@ async def trim_and_summarize(
 
     memory = ltm.add(
         summary=summary.strip(),
-        original_tokens=original_tokens,
         time_start=time_start,
         time_end=time_end,
         embedding=embedding,

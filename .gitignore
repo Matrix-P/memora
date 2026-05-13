@@ -1,4 +1,6 @@
 .env
+llm-wiki.md
+technical.md
 __pycache__/
 *.pyc
 *.pyo

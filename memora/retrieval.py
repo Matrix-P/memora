@@ -82,6 +82,8 @@ class MemoryRetrieval:
                     self.ltm.increment_ref(mem_id)
                 elif mem_type == "knowledge":
                     self.knowledge.increment_ref(mem_id)
+                elif mem_type == "persona":
+                    self.persona.increment_ref(mem_id)
 
         return results
 
